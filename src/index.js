@@ -210,10 +210,12 @@ async function handleSendEmail(request, env, session) {
   try { body = await request.json(); } catch { return jsonResponse({ error: 'Invalid JSON' }, 400, request, env); }
   const { to, subject, text, html, replyTo } = body;
   if (!to || !subject || (!text && !html)) return jsonResponse({ error: 'Required: to, subject, text or html' }, 400, request, env);
-  const fromAddress = env.MAIL_FROM_ADDRESS || `mail@${new URL(request.url).hostname}`;
-  const fromName    = env.MAIL_FROM_NAME    || 'ETAMail';
-  const apiKey      = env.RESEND_API_KEY;
-  if (!apiKey) return jsonResponse({ error: 'RESEND_API_KEY not configured. Run: wrangler secret put RESEND_API_KEY' }, 500, request, env);
+  const apiKey = env.RESEND_API_KEY;
+  if (!apiKey) return jsonResponse({ error: 'RESEND_API_KEY not set. Run: wrangler secret put RESEND_API_KEY' }, 500, request, env);
+  // If domain not verified on Resend, use their test sender (only sends to verified account email)
+  const configuredFrom = env.MAIL_FROM_ADDRESS || '';
+  const fromName       = env.MAIL_FROM_NAME || 'ETAMail';
+  const fromAddress    = configuredFrom || 'onboarding@resend.dev';
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -228,7 +230,12 @@ async function handleSendEmail(request, env, session) {
       }),
     });
     const resData = await res.json();
-    if (!res.ok) throw new Error(`Resend ${res.status}: ${JSON.stringify(resData)}`);
+    if (!res.ok) {
+      if (res.status === 403 && resData.message?.includes('not verified')) {
+        return jsonResponse({ error: `Domain "${fromAddress.split('@')[1]}" not verified on Resend.\n\nFix options:\n1. Go to resend.com/domains → Add & verify ${fromAddress.split('@')[1]}\n2. Or set MAIL_FROM_ADDRESS=onboarding@resend.dev in wrangler.toml (only sends to your own email)\n\nAfter verifying domain: wrangler deploy` }, 403, request, env);
+      }
+      throw new Error(`Resend ${res.status}: ${resData.message || JSON.stringify(resData)}`);
+    }
     const payload = JSON.stringify({ subject, from: fromAddress, to, date: new Date().toISOString(), body: text || html, isHtml: !!html });
     const aesKey  = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt']);
     const iv      = crypto.getRandomValues(new Uint8Array(12));
