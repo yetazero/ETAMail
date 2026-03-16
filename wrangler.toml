@@ -1,54 +1,37 @@
 # =============================================================================
 # wrangler.toml — Cloudflare Worker Configuration
 # =============================================================================
-name = 'etamail'
+name = "etemail"
 main = "dist/index.js"
 compatibility_date = "2025-01-01"
 
 # --------------------------------------------------------------------------
 # KV Namespaces
-# Run `wrangler kv namespace create EMAILS_KV` (and AUTH_KV) 
-# and paste the generated IDs below.
+# Bindings are configured via Cloudflare Dashboard (Settings -> Functions)
+# to avoid hardcoding IDs in the repository.
 # --------------------------------------------------------------------------
-[[kv_namespaces]]
-binding    = "EMAILS_KV"
-id         = "REPLACE_WITH_YOUR_EMAILS_KV_ID"
-preview_id = "REPLACE_WITH_YOUR_EMAILS_KV_PREVIEW_ID"
-
-[[kv_namespaces]]
-binding    = "AUTH_KV"
-id         = "REPLACE_WITH_YOUR_AUTH_KV_ID"
-preview_id = "REPLACE_WITH_YOUR_AUTH_KV_PREVIEW_ID"
+# [[kv_namespaces]]
+# binding = "EMAILS_KV"
+#
+# [[kv_namespaces]]
+# binding = "AUTH_KV"
 
 # --------------------------------------------------------------------------
 # Public Environment Variables (NO SECRETS HERE)
 # --------------------------------------------------------------------------
 [vars]
-# Network name for the SIWE message (displayed in SafePal during signing)
-CHAIN_NAME = "Ethereum"
-
-# Session token TTL in seconds (default: 86400 = 24 hours)
-SESSION_TTL = "86400"
-
-# Challenge nonce TTL in seconds (default: 300 = 5 minutes)
-NONCE_TTL = "300"
-
-# CORS allowed origins (comma-separated, or * for all)
-ALLOWED_ORIGINS = "*"
+CHAIN_NAME      = "Polygon"
+SESSION_TTL     = "86400"
+NONCE_TTL       = "300"
+ALLOWED_ORIGINS = "https://mail.yetazero.xyz"
 
 # --------------------------------------------------------------------------
 # SECRETS (Do NOT hardcode secrets in this file!)
-# --------------------------------------------------------------------------
-# Run the following commands in your terminal to securely add your data:
-#
-# 1. Your allowed SafePal wallet address (must be lowercase, e.g., 0xabc...):
-#    $ wrangler secret put ALLOWED_ADDRESS
-#
-# 2. A random secret key for session signing (minimum 32 characters):
-#    $ wrangler secret put JWT_SECRET
+# Set them via Cloudflare Dashboard (Settings -> Variables -> Secrets)
+# or using: wrangler secret put <NAME>
 # --------------------------------------------------------------------------
 
-# Local development settings (`wrangler dev`)
+# Local development settings
 [dev]
 port = 8787
 local_protocol = "http"
