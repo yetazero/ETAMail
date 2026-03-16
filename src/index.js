@@ -1,156 +1,188 @@
+import { secp256k1 }  from '@noble/curves/secp256k1';
+import { keccak_256 } from '@noble/hashes/sha3';
 
-import { secp256k1 }   from '@noble/curves/secp256k1';
-import { keccak_256 }  from '@noble/hashes/sha3';
-
-/* =============================================================================
-   ГЛАВНЫЙ ОБРАБОТЧИК
-   ============================================================================= */
 export default {
+
+  /* ── FETCH ─────────────────────────────────────────────────── */
   async fetch(request, env, ctx) {
-    // Обрабатываем CORS preflight
-    if (request.method === 'OPTIONS') {
-      return corsPreflightResponse(request, env);
-    }
-
-    const url      = new URL(request.url);
-    const pathname = url.pathname;
-
+    if (request.method === 'OPTIONS') return corsPreflightResponse(request, env);
+    const url = new URL(request.url);
+    const p   = url.pathname;
     try {
-      // ── Роутер ──────────────────────────────────────────────────────────────
-      // Авторизация
-      if (pathname === '/auth/challenge' && request.method === 'POST') {
-        return await handleChallenge(request, env);
-      }
-      if (pathname === '/auth/verify' && request.method === 'POST') {
-        return await handleVerify(request, env);
-      }
-      if (pathname === '/auth/logout' && request.method === 'DELETE') {
-        return await handleLogout(request, env);
-      }
-      if (pathname === '/auth/me' && request.method === 'GET') {
-        return await handleMe(request, env);
-      }
-
-      // Письма — требуют авторизации
-      if (pathname === '/list' && request.method === 'GET') {
-        return await withAuth(request, env, handleList);
-      }
-      if (pathname === '/get' && request.method === 'GET') {
-        return await withAuth(request, env, handleGet);
-      }
-      if (pathname === '/put' && request.method === 'POST') {
-        return await withAuth(request, env, handlePut);
-      }
-      if (pathname === '/delete' && request.method === 'DELETE') {
-        return await withAuth(request, env, handleDelete);
-      }
-
-      // 404
-      return jsonResponse({ error: 'Маршрут не найден' }, 404, request, env);
-
+      if (p === '/auth/challenge' && request.method === 'POST')  return await handleChallenge(request, env);
+      if (p === '/auth/verify'   && request.method === 'POST')   return await handleVerify(request, env);
+      if (p === '/auth/logout'   && request.method === 'DELETE') return await handleLogout(request, env);
+      if (p === '/auth/me'       && request.method === 'GET')    return await handleMe(request, env);
+      if (p === '/list'   && request.method === 'GET')    return await withAuth(request, env, handleList);
+      if (p === '/get'    && request.method === 'GET')    return await withAuth(request, env, handleGet);
+      if (p === '/put'    && request.method === 'POST')   return await withAuth(request, env, handlePut);
+      if (p === '/delete' && request.method === 'DELETE') return await withAuth(request, env, handleDelete);
+      return jsonResponse({ error: 'Not found' }, 404, request, env);
     } catch (err) {
       console.error('[Worker Error]', err);
-      return jsonResponse({ error: 'Внутренняя ошибка сервера' }, 500, request, env);
+      return jsonResponse({ error: 'Internal server error' }, 500, request, env);
     }
   },
+
+  /* ── EMAIL ─────────────────────────────────────────────────── */
+  async email(message, env, ctx) {
+    try {
+      const rawBytes = await new Response(message.raw).arrayBuffer();
+      const rawText  = new TextDecoder('utf-8', { fatal: false }).decode(rawBytes);
+      const parsed   = parseMime(rawText);
+
+      const sender  = message.from              || parsed.headers['from']    || 'unknown@sender';
+      const subject = parsed.headers['subject'] || '(no subject)';
+      const date    = parsed.headers['date']    || new Date().toISOString();
+      const to      = message.to                || parsed.headers['to']      || '';
+
+      const body   = parsed.html
+        ? inlineCidImages(parsed.html, parsed.attachments)
+        : (parsed.text || '(empty)');
+      const isHtml = !!parsed.html;
+
+      const payload = JSON.stringify({
+        subject, from: sender, to, date, body, isHtml,
+        attachments: parsed.attachments
+          .filter(a => !a.contentId)
+          .map(a => ({ name: a.name, type: a.type, data: a.data, size: a.size })),
+      });
+
+      // AES-256-GCM шифрование
+      const aesKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt']);
+      const iv     = crypto.getRandomValues(new Uint8Array(12));
+      const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, new TextEncoder().encode(payload));
+      const rawKey = await crypto.subtle.exportKey('raw', aesKey);
+
+      const toB64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+      const blob  = { iv: toB64(iv.buffer), key: toB64(rawKey), payload: toB64(cipher) };
+
+      const owner = (env.ALLOWED_ADDRESS || 'unknown').toLowerCase();
+      const msgId = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
+      const kvKey = `email:${owner}:${msgId}`;
+
+      await env.EMAILS_KV.put(kvKey, JSON.stringify(blob), {
+        metadata: {
+          sender:  sender.slice(0, 200),
+          subject: subject.slice(0, 300),
+          date,
+          folder:  'inbox',
+          unread:  true,
+        },
+      });
+
+      console.log(`[email] saved ${kvKey} | from: ${sender} | subject: ${subject}`);
+
+    } catch (err) {
+      console.error('[email] error:', err?.message || err);
+    }
+  },
+
 };
 
-/**
- * Email handler — принимает входящие письма через Cloudflare Email Routing.
- * Включить в wrangler.toml:
- *   [[email]]
- *   type = "worker"
- */
-export async function email(message, env, ctx) {
-  // 1. Читаем сырой MIME поток
-  const rawEmail = await new Response(message.raw).text();
+/* ── MIME PARSER ────────────────────────────────────────────────────────────── */
 
-  // 2. Вытаскиваем заголовки (простой парсер)
-  const headers  = {};
-  const lines    = rawEmail.split('\r\n');
-  for (const line of lines) {
-    if (line === '') break; // конец заголовков
-    const idx = line.indexOf(':');
-    if (idx === -1) continue;
-    const key = line.slice(0, idx).trim().toLowerCase();
-    const val = line.slice(idx + 1).trim();
-    headers[key] = val;
+function parseMime(raw) {
+  const result = { headers: {}, text: '', html: '', attachments: [], _root: true };
+  parsePart(raw, result);
+  return result;
+}
+
+function parsePart(raw, result) {
+  const split    = raw.indexOf('\r\n\r\n');
+  const hdrBlock = split !== -1 ? raw.slice(0, split) : raw;
+  const body     = split !== -1 ? raw.slice(split + 4) : '';
+  const headers  = parseHeaders(hdrBlock);
+
+  if (result._root) { result.headers = { ...result.headers, ...headers }; delete result._root; }
+
+  const ct      = headers['content-type'] || 'text/plain';
+  const ctLower = ct.toLowerCase();
+  const enc     = (headers['content-transfer-encoding'] || '').toLowerCase().trim();
+  const cid     = (headers['content-id'] || '').replace(/[<>]/g, '').trim();
+  const disp    = (headers['content-disposition'] || '').toLowerCase();
+  const isAttach = disp.startsWith('attachment');
+
+  if (ctLower.startsWith('multipart/')) {
+    const bm = ct.match(/boundary\s*=\s*"?([^";]+)"?/i);
+    if (!bm) return;
+    for (const part of splitMultipart(body, bm[1].trim())) parsePart(part, result);
+    return;
   }
 
-  const sender  = message.from || headers['from']  || 'unknown@sender';
-  const subject = headers['subject'] || '(no subject)';
-  const date    = headers['date']    || new Date().toISOString();
+  let decoded = enc === 'base64'            ? body.replace(/\s/g, '')
+              : enc === 'quoted-printable'  ? decodeQP(body)
+              : body;
 
-  // 3. Вытаскиваем тело (после первой пустой строки)
-  const bodyStart = rawEmail.indexOf('\r\n\r\n');
-  const rawBody   = bodyStart !== -1 ? rawEmail.slice(bodyStart + 4) : rawEmail;
+  const csm     = ct.match(/charset\s*=\s*"?([^";]+)"?/i);
+  const charset = csm ? csm[1].trim() : 'utf-8';
 
-  // 4. Получатель — из какого адреса пришло (ваш @yourdomain)
-  const recipient = message.to || 'inbox';
+  if (ctLower.startsWith('text/html') && !isAttach) {
+    result.html += enc === 'base64' ? b64Decode(decoded, charset) : decoded;
+    return;
+  }
+  if (ctLower.startsWith('text/plain') && !isAttach) {
+    result.text += enc === 'base64' ? b64Decode(decoded, charset) : decoded;
+    return;
+  }
 
-  // 5. Формируем plaintext payload для шифрования
-  const payload = JSON.stringify({
-    subject,
-    from:   sender,
-    to:     recipient,
-    date,
-    body:   rawBody,
+  const namem  = ct.match(/name\s*=\s*"?([^";]+)"?/i) || disp.match(/filename\s*=\s*"?([^";]+)"?/i);
+  const name   = namem ? namem[1].trim() : (cid || 'attachment');
+  const b64    = enc === 'base64' ? decoded : btoa(decoded);
+
+  result.attachments.push({
+    name, type: ctLower.split(';')[0].trim(),
+    data: b64, contentId: cid || null,
+    size: Math.round(b64.length * 0.75),
   });
+}
 
-  // 6. Генерируем ключ шифрования AES-256-GCM прямо в Worker
-  //    (per-message ключ — Zero-Trust: мы его не храним нигде отдельно,
-  //     а кладём рядом с письмом в зашифрованном виде)
-  const aesKey  = await crypto.subtle.generateKey(
-    { name: 'AES-GCM', length: 256 }, true, ['encrypt']
-  );
-  const iv      = crypto.getRandomValues(new Uint8Array(12));
-  const encoded = new TextEncoder().encode(payload);
+function parseHeaders(block) {
+  const headers = {};
+  const lines   = block.replace(/\r\n([ \t])/g, ' ').split('\r\n');
+  for (const line of lines) {
+    const idx = line.indexOf(':'); if (idx === -1) continue;
+    headers[line.slice(0, idx).trim().toLowerCase()] = decodeRfc2047(line.slice(idx + 1).trim());
+  }
+  return headers;
+}
 
-  const cipherBuf = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv }, aesKey, encoded
-  );
+function splitMultipart(body, boundary) {
+  const parts = [], delim = `--${boundary}`, end = `--${boundary}--`;
+  let current = [], inPart = false;
+  for (const line of body.split('\r\n')) {
+    if (line === end)   { if (inPart) parts.push(current.join('\r\n')); break; }
+    if (line === delim) { if (inPart) parts.push(current.join('\r\n')); current = []; inPart = true; continue; }
+    if (inPart) current.push(line);
+  }
+  return parts;
+}
 
-  // 7. Экспортируем ключ для хранения рядом с письмом
-  const rawKeyBuf = await crypto.subtle.exportKey('raw', aesKey);
+function decodeQP(str) {
+  return str.replace(/=\r\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+}
 
-  // 8. Конвертируем всё в Base64
-  const toB64 = (buf) => {
-    const bytes = new Uint8Array(buf);
-    let s = '';
-    for (const b of bytes) s += String.fromCharCode(b);
-    return btoa(s);
-  };
+function b64Decode(b64, charset) {
+  try { return new TextDecoder(charset, { fatal: false }).decode(Uint8Array.from(atob(b64), c => c.charCodeAt(0))); }
+  catch { return atob(b64); }
+}
 
-  const blob = {
-    iv:      toB64(iv.buffer),
-    key:     toB64(rawKeyBuf),      // per-message AES ключ
-    payload: toB64(cipherBuf),
-  };
+function decodeRfc2047(str) {
+  return str.replace(/=\?([^?]+)\?([BQbq])\?([^?]+)\?=/g, (_, charset, enc, text) => {
+    try {
+      const bytes = enc.toUpperCase() === 'B'
+        ? Uint8Array.from(atob(text), c => c.charCodeAt(0))
+        : Uint8Array.from(decodeQP(text.replace(/_/g, ' ')), c => c.charCodeAt(0));
+      return new TextDecoder(charset, { fatal: false }).decode(bytes);
+    } catch { return text; }
+  });
+}
 
-  // 9. Определяем адрес кошелька-владельца из env
-  //    (тот же ALLOWED_ADDRESS что и в auth)
-  const ownerAddress = (env.ALLOWED_ADDRESS || 'unknown').toLowerCase();
-
-  // 10. Генерируем ключ KV
-  const msgId  = Date.now().toString(36) + '-' + toB64(crypto.getRandomValues(new Uint8Array(6))).replace(/[^a-z0-9]/gi, '');
-  const kvKey  = `email:${ownerAddress}:${msgId}`;
-
-  // 11. Сохраняем зашифрованный блоб с метаданными
-  await env.EMAILS_KV.put(
-    kvKey,
-    JSON.stringify(blob),
-    {
-      metadata: {
-        sender:  sender.slice(0, 100),   // обрезаем на случай длинных адресов
-        subject: subject.slice(0, 200),
-        date,
-        folder:  'inbox',
-        unread:  true,
-      },
-    }
-  );
-
-  console.log(`[email] Saved: ${kvKey} | from: ${sender} | subject: ${subject}`);
+function inlineCidImages(html, attachments) {
+  return html.replace(/cid:([^"'\s>]+)/gi, (match, cid) => {
+    const att = attachments.find(a => a.contentId === cid);
+    return att ? `data:${att.type};base64,${att.data}` : match;
+  });
 }
 
 /* =============================================================================
