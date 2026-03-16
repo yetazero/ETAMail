@@ -230,17 +230,13 @@ async function handleChallenge(request, env) {
 
   // SIWE-совместимое сообщение (EIP-4361)
   // SafePal покажет его пользователю перед подписью
-  const domain  = 'securemail.worker.dev';
+  const domain  = 'mail.yetazero.xyz';
   const chainId = getChainId(env.CHAIN_NAME || 'Ethereum');
   const message = buildSiweMessage({
     domain,
     address,
-    statement: 'Войти в SecureMail. Подтвердите вход своим кошельком SafePal.',
+    statement: 'Войти в ETAMail. Подтвердите вход своим кошельком.',
     uri:       `https://${domain}`,
-    version:   '1',
-    chainId,
-    nonce,
-    issuedAt,
   });
 
   // Сохраняем нонс в KV (с TTL)
@@ -584,17 +580,14 @@ async function handleDelete(request, env, session) {
 function recoverEthAddress(address, nonce, issuedAt, signature, env) {
   try {
     // 1. Строим SIWE-сообщение (точно такое же как в handleChallenge)
-    const domain  = 'securemail.worker.dev';
+    const domain  = 'mail.yetazero.xyz';
     const chainId = getChainId(env.CHAIN_NAME || 'Ethereum');
     const message = buildSiweMessage({
       domain,
       address,
-      statement: 'Войти в SecureMail. Подтвердите вход своим кошельком SafePal.',
+      statement: 'Войти в ETAMail. Подтвердите вход своим кошельком.',
       uri:       `https://${domain}`,
       version:   '1',
-      chainId,
-      nonce,
-      issuedAt,
     });
 
     // 2. Ethereum prefix (EIP-191): "\x19Ethereum Signed Message:\n" + длина + сообщение
