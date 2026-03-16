@@ -3,7 +3,7 @@
 # =============================================================================
 name = "etamail"
 main = "dist/index.js"
-compatibility_date = "2025-01-01"
+compatibility_date = "2026-03-03"
 
 # --------------------------------------------------------------------------
 # KV Namespaces
@@ -23,7 +23,12 @@ compatibility_date = "2025-01-01"
 CHAIN_NAME      = "Polygon"
 SESSION_TTL     = "86400"
 NONCE_TTL       = "300"
-ALLOWED_ORIGINS = "https://mail.yetazero.xyz"
+ALLOWED_ORIGINS = "*"
+#MAIL_FROM_ADDRESS     = ""
+#MAIL_FROM_NAME        = "ETAMail"
+#NOSTR_RELAY_HTTP      = "https://relay.damus.io"
+#TELEGRAM_ALLOWED_CHAT = "YOUR_TELEGRAM_USER_ID"
+
 
 # --------------------------------------------------------------------------
 # SECRETS (Do NOT hardcode secrets in this file!)
