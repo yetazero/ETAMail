@@ -2,7 +2,7 @@
 # wrangler.toml — Cloudflare Worker Configuration
 # =============================================================================
 name = "securemail-worker"
-main = "src/index.js"
+main = "dist/index.js"
 compatibility_date = "2025-01-01"
 
 # --------------------------------------------------------------------------
