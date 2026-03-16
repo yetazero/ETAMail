@@ -24,6 +24,7 @@ export default {
       if (p === '/telegram/messages'  && request.method === 'GET')    return await withAuth(request, env, handleTelegramMessages);
       if (p === '/telegram/send'      && request.method === 'POST')   return await withAuth(request, env, handleTelegramSend);
       if (p === '/telegram/webhook'   && request.method === 'POST')   return await handleTelegramWebhook(request, env);
+      if (p.startsWith('/xmtp-proxy') && request.method === 'GET')    return await handleXmtpProxy(request, env);
       return jsonResponse({ error: 'Not found' }, 404, request, env);
     } catch (err) {
       console.error('[Worker]', err);
@@ -322,117 +323,39 @@ async function handleTelegramWebhook(request, env) {
 }
 
 async function processTgMessage(msg, token, env) {
-  const chatId  = msg.chat.id;
-  const text    = (msg.text || '').trim();
-  const allowed = env.TELEGRAM_ALLOWED_CHAT;
-  if (allowed && String(chatId) !== String(allowed)) {
-    await tgSend(token, chatId, '🚫 Unauthorized.');
-    return;
-  }
-
+  const chatId   = msg.chat.id;
+  const text     = (msg.text || '').trim();
   const key      = `tg:chat:${chatId}`;
   const chatData = await env.AUTH_KV.get(key, 'json') || { user: {}, messages: [], unread: 0 };
-  chatData.user  = { chatId, username: msg.from?.username || chatData.user?.username || '', firstName: msg.from?.first_name || chatData.user?.firstName || '', lastName: msg.from?.last_name || chatData.user?.lastName || '', linkedAt: chatData.user?.linkedAt || '' };
 
-  const stateData = await env.AUTH_KV.get(`tg:state:${chatId}`, 'json');
+  // Update user info
+  chatData.user = {
+    chatId,
+    username:  msg.from?.username  || chatData.user?.username  || '',
+    firstName: msg.from?.first_name || chatData.user?.firstName || '',
+    lastName:  msg.from?.last_name  || chatData.user?.lastName  || '',
+    linkedAt:  chatData.user?.linkedAt || new Date().toISOString(),
+  };
 
-  const isCommand = text.startsWith('/');
-  if (!isCommand) {
-    chatData.messages.push({ text, dir: 'in', ts: (msg.date || Math.floor(Date.now()/1000)) * 1000 });
-    if (chatData.messages.length > 200) chatData.messages = chatData.messages.slice(-200);
-    chatData.unread = (chatData.unread || 0) + 1;
+  if (text === '/start') {
+    await tgSend(token, chatId, `👋 Hi ${chatData.user.firstName || 'there'}! You're now connected to ETAMail.\n\nJust write me a message and the owner will see it in their dashboard.`);
+    chatData.user.linkedAt = chatData.user.linkedAt || new Date().toISOString();
     await env.AUTH_KV.put(key, JSON.stringify(chatData));
-  }
-
-  if (stateData?.action === 'awaiting_reply_body') {
-    await env.AUTH_KV.delete(`tg:state:${chatId}`);
-    await sendEmailResend(env, { to: stateData.to, subject: stateData.subject, text });
-    await tgSend(token, chatId, `✅ Reply sent to ${stateData.to}`);
-    return;
-  }
-  if (stateData?.action === 'awaiting_compose_to') {
-    await env.AUTH_KV.put(`tg:state:${chatId}`, JSON.stringify({ action: 'awaiting_compose_subject', to: text }), { expirationTtl: 300 });
-    await tgSend(token, chatId, `📝 Subject:`);
-    return;
-  }
-  if (stateData?.action === 'awaiting_compose_subject') {
-    await env.AUTH_KV.put(`tg:state:${chatId}`, JSON.stringify({ action: 'awaiting_compose_body', to: stateData.to, subject: text }), { expirationTtl: 300 });
-    await tgSend(token, chatId, `✏️ Message body:`);
-    return;
-  }
-  if (stateData?.action === 'awaiting_compose_body') {
-    await env.AUTH_KV.delete(`tg:state:${chatId}`);
-    await sendEmailResend(env, { to: stateData.to, subject: stateData.subject, text });
-    await tgSend(token, chatId, `✅ Email sent to ${stateData.to}`);
     return;
   }
 
-  if (!isCommand) return;
-
-  if (text === '/start' || text === '/help') {
-    await tgSend(token, chatId, `🔐 *ETAMail*\n\n/inbox — last 5 emails\n/unread — unread\n/compose — write email\n/stats — stats\n/link — link this chat\n/cancel — cancel`, { parse_mode: 'Markdown' });
-    return;
-  }
-  if (text === '/cancel') { await env.AUTH_KV.delete(`tg:state:${chatId}`); await tgSend(token, chatId, '✅ Cancelled.'); return; }
-  if (text === '/compose') { await env.AUTH_KV.put(`tg:state:${chatId}`, JSON.stringify({ action: 'awaiting_compose_to' }), { expirationTtl: 300 }); await tgSend(token, chatId, '📧 To (email):'); return; }
-  if (text === '/link') {
-    chatData.user.linkedAt = new Date().toISOString();
-    await env.AUTH_KV.put(key, JSON.stringify(chatData));
-    await tgSend(token, chatId, `✅ Chat linked! Messages from ETAMail will appear here.`);
-    return;
-  }
-  if (text === '/inbox' || text === '/unread') {
-    const onlyUnread = text === '/unread';
-    const owner      = (env.ALLOWED_ADDRESS || '').toLowerCase();
-    const listed     = await env.EMAILS_KV.list({ prefix: `email:${owner}:`, limit: 50 });
-    let emails       = listed.keys.filter(k => !k.name.includes(':sent:')).map(k => ({ key: k.name, sender: k.metadata?.sender || '?', subject: k.metadata?.subject || '(no subject)', date: k.metadata?.date || '', unread: k.metadata?.unread !== false })).sort((a,b) => new Date(b.date)-new Date(a.date));
-    if (onlyUnread) emails = emails.filter(e => e.unread);
-    if (!emails.length) { await tgSend(token, chatId, onlyUnread ? '📭 No unread.' : '📭 Empty.'); return; }
-    const lines    = emails.slice(0,5).map((e,i) => `${i+1}. ${e.unread?'🔵':'⚪'} *${escTg(e.subject)}*\n   ${escTg(e.sender)}`).join('\n\n');
-    const keyboard = { inline_keyboard: emails.slice(0,5).map((e,i) => [{ text: `↩️ Reply ${i+1}`, callback_data: `reply:${i}:${e.sender.slice(0,20)}:${e.subject.slice(0,20)}` }]) };
-    await env.AUTH_KV.put(`tg:inbox:${chatId}`, JSON.stringify(emails.slice(0,5).map(e => ({ sender: e.sender, subject: e.subject }))), { expirationTtl: 300 });
-    await tgSend(token, chatId, `📬 *(${emails.length} total)*:\n\n${lines}`, { parse_mode: 'Markdown', reply_markup: JSON.stringify(keyboard) });
-    return;
-  }
-  if (text === '/stats') {
-    const owner  = (env.ALLOWED_ADDRESS || '').toLowerCase();
-    const listed = await env.EMAILS_KV.list({ prefix: `email:${owner}:`, limit: 1000 });
-    const total  = listed.keys.filter(k => !k.name.includes(':sent:')).length;
-    const sent   = listed.keys.filter(k => k.name.includes(':sent:')).length;
-    const unread = listed.keys.filter(k => !k.name.includes(':sent:') && k.metadata?.unread !== false).length;
-    await tgSend(token, chatId, `📊 *Stats*\n\n📥 Inbox: ${total}\n📤 Sent: ${sent}\n🔵 Unread: ${unread}`, { parse_mode: 'Markdown' });
-    return;
-  }
-  await tgSend(token, chatId, '❓ Unknown command. /help');
+  // Store every message (including commands other than /start)
+  chatData.messages.push({ text, dir: 'in', ts: (msg.date || Math.floor(Date.now()/1000)) * 1000 });
+  if (chatData.messages.length > 500) chatData.messages = chatData.messages.slice(-500);
+  chatData.unread = (chatData.unread || 0) + 1;
+  await env.AUTH_KV.put(key, JSON.stringify(chatData));
 }
 
 async function processTgCallback(cb, token, env) {
-  const chatId = cb.message?.chat?.id;
-  const data   = cb.data || '';
-  await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ callback_query_id: cb.id }) });
-  if (data.startsWith('reply:')) {
-    const parts   = data.split(':');
-    const idx     = parseInt(parts[1]);
-    const inbox   = await env.AUTH_KV.get(`tg:inbox:${chatId}`, 'json') || [];
-    const email   = inbox[idx];
-    if (!email) { await tgSend(token, chatId, '❌ Email not found. Use /inbox again.'); return; }
-    const subject = email.subject.startsWith('Re:') ? email.subject : `Re: ${email.subject}`;
-    await env.AUTH_KV.put(`tg:state:${chatId}`, JSON.stringify({ action: 'awaiting_reply_body', to: email.sender, subject }), { expirationTtl: 300 });
-    await tgSend(token, chatId, `↩️ Replying to *${escTg(email.sender)}*\nSubject: *${escTg(subject)}*\n\nWrite your reply:`, { parse_mode: 'Markdown' });
-  }
-}
-
-async function sendEmailResend(env, { to, subject, text }) {
-  const apiKey = env.RESEND_API_KEY;
-  if (!apiKey) throw new Error('RESEND_API_KEY not set');
-  const fromAddress = env.MAIL_FROM_ADDRESS || 'mail@yetazero.xyz';
-  const fromName    = env.MAIL_FROM_NAME    || 'ETAMail';
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: `${fromName} <${fromAddress}>`, to: [to], subject, text }),
+  await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ callback_query_id: cb.id }),
   });
-  if (!res.ok) throw new Error(`Resend ${res.status}`);
 }
 
 async function tgBroadcast(env, text) {
@@ -441,12 +364,39 @@ async function tgBroadcast(env, text) {
   const chats = await env.AUTH_KV.list({ prefix: 'tg:chat:' });
   for (const key of chats.keys) {
     const data = await env.AUTH_KV.get(key.name, 'json');
-    if (data?.user?.chatId && data.user.linkedAt) {
-      await tgSend(token, data.user.chatId, text, { parse_mode: 'Markdown' }).catch(() => {});
+    if (data?.user?.chatId) {
+      await tgSend(token, data.user.chatId, text).catch(() => {});
     }
   }
 }
 
+// Proxy XMTP worker scripts from esm.sh so they load from same origin
+async function handleXmtpProxy(request, env) {
+  const url       = new URL(request.url);
+  const targetUrl = url.searchParams.get('url');
+  if (!targetUrl || !targetUrl.startsWith('https://esm.sh/')) {
+    return new Response('Invalid proxy target', { status: 400 });
+  }
+  try {
+    const res  = await fetch(targetUrl, { headers: { 'Accept': 'application/javascript' } });
+    const body = await res.text();
+    // Rewrite any nested esm.sh worker URLs to also go through our proxy
+    const rewritten = body.replace(
+      /new Worker\(["']([^"']+esm\.sh[^"']+)["']/g,
+      (match, workerUrl) => `new Worker("${url.origin}/xmtp-proxy?url=${encodeURIComponent(workerUrl)}"`
+    );
+    const origin = request.headers.get('Origin') || '*';
+    return new Response(rewritten, {
+      headers: {
+        'Content-Type': 'application/javascript',
+        'Access-Control-Allow-Origin': origin,
+        'Cache-Control': 'public, max-age=3600',
+      },
+    });
+  } catch (err) {
+    return new Response(`Proxy error: ${err.message}`, { status: 502 });
+  }
+}
 async function tgSend(token, chatId, text, extra = {}) {
   return fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
