@@ -35,3 +35,6 @@ ALLOWED_ORIGINS = "https://mail.yetazero.xyz"
 [dev]
 port = 8787
 local_protocol = "http"
+
+[[email]]
+type = "worker"
