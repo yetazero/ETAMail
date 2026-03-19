@@ -344,7 +344,6 @@ async function processTgMessage(msg, token, env) {
     return;
   }
 
-  // Store every message (including commands other than /start)
   chatData.messages.push({ text, dir: 'in', ts: (msg.date || Math.floor(Date.now()/1000)) * 1000 });
   if (chatData.messages.length > 500) chatData.messages = chatData.messages.slice(-500);
   chatData.unread = (chatData.unread || 0) + 1;
@@ -370,7 +369,6 @@ async function tgBroadcast(env, text) {
   }
 }
 
-// Proxy XMTP worker scripts from esm.sh so they load from same origin
 async function handleXmtpProxy(request, env) {
   const url       = new URL(request.url);
   const targetUrl = url.searchParams.get('url');
